@@ -57,9 +57,9 @@ jobs:
     - name: Deploy to Test VM
       uses: appleboy/ssh-action@v1.0.3
       with:
-        host: ${{ secrets.TEST_HOST }}
-        username: ${{ secrets.VM_USER }}
-        key: ${{ secrets.VM_SSH_KEY }}
+        host: linvm-Test2
+        username: ${{ secrets_VM_USER }}
+        key: ${{ secrets_VM_SSH_KEY }}
         script: |
           set -e # Exit immediately if any command fails
 
