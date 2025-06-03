@@ -30,7 +30,10 @@ jobs:
     - name: Archive Build Artifact
       run: |
         mkdir artifact
-        cp -r . artifact/
+        # Copy the contents of the current directory into the artifact directory.
+        # This avoids trying to copy 'artifact' into itself.
+        # It typically excludes hidden files (like .git) which is usually desired for deployment.
+        cp -r ./* artifact/
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
