@@ -1,30 +1,288 @@
-name: Django CI
+name: Multi-Stage Django Deployment (Test → UAT → Prod)
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 4
-      matrix:
-        python-version: [3.7, 3.8, 3.9]
+    name: Build and Package Artifact
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.11'
+
     - name: Install Dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install -r requirements.txt
+
     - name: Run Tests
       run: |
         python manage.py test
+
+    - name: Archive Build Artifact
+      run: |
+        mkdir artifact
+        cp -r . artifact/
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: django-build
+        path: artifact/
+
+  deploy_test:
+    name: Deploy to Test
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+    - name: Download Build Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: django-build
+        path: artifact
+
+    - name: Deploy to Test VM
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.TEST_HOST }}
+        username: ${{ secrets.VM_USER }}
+        key: ${{ secrets.VM_SSH_KEY }}
+        script: |
+          set -e # Exit immediately if any command fails
+
+          APP_DIR=~/django-app-test # Define app directory for clarity
+          ARTIFACT_DIR=~/artifact # Define artifact directory for clarity
+
+          # Create app directory if it doesn't exist
+          mkdir -p $APP_DIR
+
+          # Clean and copy new code
+          rm -rf $APP_DIR/* # More targeted removal
+          cp -r $ARTIFACT_DIR/* $APP_DIR/
+
+          cd $APP_DIR
+
+          # Setup virtual environment (create if not exists)
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          source venv/bin/activate
+
+          # Install/Update dependencies
+          pip install --upgrade -r requirements.txt
+
+          # Run migrations
+          python manage.py migrate --noinput
+
+          # Collect static files
+          python manage.py collectstatic --noinput
+
+          # Restart Gunicorn and reload Nginx
+          sudo systemctl restart gunicorn
+          sudo systemctl reload nginx
+
+    - name: Verify Test Application Health
+      run: |
+        # IMPORTANT: Replace with your actual test environment URL and health endpoint
+        curl --fail --silent --show-error https://your-test-app-url.com/health/ || { echo "Test health check failed!"; exit 1; }
+
+  deploy_uat:
+    name: Deploy to UAT
+    runs-on: ubuntu-22.04
+    needs: deploy_test
+
+    steps:
+    - name: Download Build Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: django-build
+        path: artifact
+
+    - name: Deploy to UAT VM
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.UAT_HOST }}
+        username: ${{ secrets.VM_USER }}
+        key: ${{ secrets.VM_SSH_KEY }}
+        script: |
+          set -e # Exit immediately if any command fails
+
+          APP_DIR=~/django-app-uat # Define app directory for clarity
+          ARTIFACT_DIR=~/artifact # Define artifact directory for clarity
+
+          # Create app directory if it doesn't exist
+          mkdir -p $APP_DIR
+
+          # Clean and copy new code
+          rm -rf $APP_DIR/* # More targeted removal
+          cp -r $ARTIFACT_DIR/* $APP_DIR/
+
+          cd $APP_DIR
+
+          # Setup virtual environment (create if not exists)
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          source venv/bin/activate
+
+          # Install/Update dependencies
+          pip install --upgrade -r requirements.txt
+
+          # Run migrations
+          python manage.py migrate --noinput
+
+          # Collect static files
+          python manage.py collectstatic --noinput
+
+          # Restart Gunicorn and reload Nginx
+          sudo systemctl restart gunicorn
+          sudo systemctl reload nginx
+
+    - name: Verify UAT Application Health
+      run: |
+        # IMPORTANT: Replace with your actual UAT environment URL and health endpoint
+        curl --fail --silent --show-error https://your-uat-app-url.com/health/ || { echo "UAT health check failed!"; exit 1; }
+
+  deploy_production:
+    name: Deploy to Production (Blue/Green)
+    runs-on: ubuntu-22.04
+    needs: deploy_uat
+    environment:
+      name: production
+      url: https://your-production-url.com # Update this to your actual production URL
+
+    steps:
+    - name: Download Build Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: django-build
+        path: artifact
+
+    - name: Deploy to Inactive Slot and Prepare
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.PROD_HOST }}
+        username: ${{ secrets.VM_USER }}
+        key: ${{ secrets.VM_SSH_KEY }}
+        script: |
+          set -e # Exit immediately if any command fails
+
+          # Define the two production slots
+          APP_DIR_SLOT_A=~/django-app-prod-slot-A
+          APP_DIR_SLOT_B=~/django-app-prod-slot-B
+          CURRENT_SYMLINK_PATH=/var/www/django-app-prod-current # Nginx points to this symlink
+          ARTIFACT_DIR=~/artifact
+
+          # Ensure slot directories exist
+          mkdir -p $APP_DIR_SLOT_A
+          mkdir -p $APP_DIR_SLOT_B
+
+          # Determine the currently active slot
+          # Read the target of the symlink. If symlink doesn't exist, default to slot A
+          if [ -L "$CURRENT_SYMLINK_PATH" ]; then
+              ACTIVE_SLOT_PATH=$(readlink -f $CURRENT_SYMLINK_PATH)
+          else
+              ACTIVE_SLOT_PATH=$APP_DIR_SLOT_A # Default if symlink doesn't exist
+          fi
+
+          # Determine the target slot for the new deployment (the inactive one)
+          if [ "$ACTIVE_SLOT_PATH" = "$APP_DIR_SLOT_A" ]; then
+              DEPLOY_TARGET_DIR=$APP_DIR_SLOT_B
+          else
+              DEPLOY_TARGET_DIR=$APP_DIR_SLOT_A
+          fi
+
+          echo "Currently active slot: $ACTIVE_SLOT_PATH"
+          echo "Deploying to inactive slot: $DEPLOY_TARGET_DIR"
+
+          # Clean and copy new code to the target slot
+          rm -rf ${DEPLOY_TARGET_DIR}/*
+          cp -r $ARTIFACT_DIR/* $DEPLOY_TARGET_DIR/
+
+          cd $DEPLOY_TARGET_DIR
+
+          # Setup virtual environment (create if not exists)
+          if [ ! -d "venv" ]; then
+            python3 -m venv venv
+          fi
+          source venv/bin/activate
+
+          # Install/Update dependencies
+          pip install --upgrade -r requirements.txt
+
+          # Run migrations (these apply to the database, not specific to the slot)
+          python manage.py migrate --noinput
+
+          # Collect static files for the new slot
+          python manage.py collectstatic --noinput
+
+          # IMPORTANT: At this point, the new version is deployed to the INACTIVE slot.
+          # You might add a health check here if you have a way to access the inactive slot
+          # (e.g., Gunicorn running on a different port for testing purposes).
+          # For simplicity, we'll rely on the final health check after the swap.
+
+    - name: Manual Approval for Production Swap
+      # This step serves as a clear indicator in the workflow logs.
+      # The actual approval gate is configured in GitHub repository settings
+      # under 'Environments' for the 'production' environment.
+      run: |
+        echo "The new application version has been deployed to the inactive slot."
+        echo "This workflow run is paused, awaiting manual approval to perform the production swap."
+        echo "Please navigate to the 'Environments' tab in your repository's workflow run details to approve."
+
+    - name: Swap Production Slot and Restart Services
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.PROD_HOST }}
+        username: ${{ secrets.VM_USER }}
+        key: ${{ secrets.VM_SSH_KEY }}
+        script: |
+          set -e # Exit immediately if any command fails
+
+          APP_DIR_SLOT_A=~/django-app-prod-slot-A
+          APP_DIR_SLOT_B=~/django-app-prod-slot-B
+          CURRENT_SYMLINK_PATH=/var/www/django-app-prod-current
+
+          # Determine the currently active slot (again, to be safe)
+          if [ -L "$CURRENT_SYMLINK_PATH" ]; then
+              ACTIVE_SLOT_PATH=$(readlink -f $CURRENT_SYMLINK_PATH)
+          else
+              ACTIVE_SLOT_PATH=$APP_DIR_SLOT_A # Default if symlink doesn't exist
+          fi
+
+          # Determine the slot that was just deployed to (the inactive one)
+          if [ "$ACTIVE_SLOT_PATH" = "$APP_DIR_SLOT_A" ]; then
+              NEW_ACTIVE_SLOT_PATH=$APP_DIR_SLOT_B
+          else
+              NEW_ACTIVE_SLOT_PATH=$APP_DIR_SLOT_A
+          fi
+
+          echo "Swapping production traffic to: $NEW_ACTIVE_SLOT_PATH"
+
+          # Atomically update the symlink
+          # Create a temporary symlink first, then rename it to avoid race conditions
+          ln -sfn $NEW_ACTIVE_SLOT_PATH ${CURRENT_SYMLINK_PATH}_temp
+          mv -Tf ${CURRENT_SYMLINK_PATH}_temp $CURRENT_SYMLINK_PATH
+
+          # Restart Gunicorn (important for it to pick up the new path)
+          sudo systemctl restart gunicorn
+
+          # Reload Nginx to ensure it's serving from the new symlink target
+          sudo systemctl reload nginx
+
+          echo "Production swap complete. Traffic is now directed to $NEW_ACTIVE_SLOT_PATH"
+
+    - name: Verify Production Application Health
+      run: |
+        # IMPORTANT: Replace with your actual production environment URL and health endpoint
+        # This health check verifies the live production URL after the swap.
+        curl --fail --silent --show-error https://your-production-url.com/health/ || { echo "Production health check failed after swap!"; exit 1; }
